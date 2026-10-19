@@ -1,0 +1,109 @@
+# Monitor externo: revisa cada 5 minutos, desde fuera del servidor, que los
+# sitios respondan, y avisa con un issue (y una ejecución fallida, que GitHub
+# manda por correo) cuando alguno cae o su certificado está por vencer.
+#
+# Vive en GitHub y no en el servidor a propósito: si el servidor cae, el
+# vigilante interno y FRIDAY caen con él.
+#
+# Los objetivos están en el secreto MONITOR_TARGETS, una línea por sitio:
+#   alias|url|texto-esperado-opcional
+# Las URLs y los hosts se enmascaran en los logs: el repo es público.
+name: Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Revisar sitios
+        env:
+          TARGETS: ${{ secrets.MONITOR_TARGETS }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TARGETS:-}" ]; then
+            echo "::error::Falta el secreto MONITOR_TARGETS"
+            exit 1
+          fi
+
+          now() { TZ=America/Lima date '+%Y-%m-%d %H:%M (Lima)'; }
+          # Sin xargs: se comería las comillas de un texto esperado como "ok":true.
+          trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"${1:-}"; }
+          # El issue abierto de un título, si existe.
+          open_issue() {
+            gh issue list -R "$REPO" --state open --limit 100 --json number,title \
+              --jq ".[] | select(.title == \"$1\") | .number" | head -1
+          }
+
+          down=0
+          while IFS='|' read -r name url keyword; do
+            name="$(trim "${name:-}")"; url="$(trim "${url:-}")"; keyword="$(trim "${keyword:-}")"
+            { [ -z "$name" ] || [ -z "$url" ] || [[ "$name" == \#* ]]; } && continue
+            host="$(printf '%s' "$url" | sed -E 's#^https?://([^/:]+).*#\1#')"
+            echo "::add-mask::$url"
+            echo "::add-mask::$host"
+
+            # Tres intentos separados por 15 s: un error suelto no es una caída.
+            ok=0; why=""
+            for try in 1 2 3; do
+              out="$(curl -sS -m 20 -A 'uptime-monitor (GitHub Actions)' -w $'\n%{http_code}' "$url" 2>/dev/null)" \
+                && code="$(tail -n1 <<<"$out")" || code=000
+              if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+                if [ -z "$keyword" ] || grep -qF -- "$keyword" <<<"$out"; then ok=1; break; fi
+                why="respondió $code pero sin el texto esperado"
+              else
+                why="HTTP $code"
+              fi
+              sleep 15
+            done
+
+            title="Caído: $name"
+            issue="$(open_issue "$title")"
+            if [ "$ok" = 1 ]; then
+              echo "OK   $name"
+              if [ -n "$issue" ]; then
+                gh issue close "$issue" -R "$REPO" -c "Volvió a responder: $(now)."
+              fi
+            else
+              echo "::error::CAÍDO $name ($why)"
+              down=1
+              if [ -z "$issue" ]; then
+                gh issue create -R "$REPO" --title "$title" \
+                  --body "@$OWNER **$name** no responde desde $(now): $why, en 3 intentos seguidos. Este issue se cierra solo cuando vuelva."
+              fi
+            fi
+
+            # Certificado: aviso a 14 días del vencimiento (certbot renueva a 30).
+            end="$(echo | timeout 15 openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null \
+              | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+            if [ -n "$end" ]; then
+              days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+              ctitle="Certificado por vencer: $name"
+              cissue="$(open_issue "$ctitle")"
+              if [ "$days" -lt 14 ]; then
+                echo "::warning::$name: el certificado vence en $days días"
+                [ -z "$cissue" ] && gh issue create -R "$REPO" --title "$ctitle" \
+                  --body "@$OWNER el certificado de **$name** vence en $days días ($(now)). Revisa la renovación de certbot."
+              elif [ -n "$cissue" ]; then
+                gh issue close "$cissue" -R "$REPO" -c "Certificado renovado: vence en $days días."
+              fi
+            fi
+          done <<< "$TARGETS"
+
+          # Una ejecución fallida también avisa por correo a quien programó el cron.
+          exit "$down"
